@@ -42,7 +42,7 @@
 //! struct PropertyPrinter;
 //!
 //! impl PropertyProcessor for PropertyPrinter {
-//!     fn property(&mut self, i: usize, n: &str, v: ColumnValue) -> bool {
+//!     fn property(&mut self, i: usize, n: &str, v: &ColumnValue) -> bool {
 //!         println!("columnidx: {} name: {} value: {:?}", i, n, v);
 //!         false // don't abort
 //!     }
