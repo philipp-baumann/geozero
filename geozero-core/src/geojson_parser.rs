@@ -61,15 +61,27 @@ pub enum Geometry {
     },
 }
 
+static mut PROCESSOR: u32 = 0;
+
+struct JsonVisitor<'a, T> {
+    processor: &'a mut u32,
+    _type: PhantomData<fn() -> T>,
+}
+
+fn get_visitor<'a, T>() -> JsonVisitor<'a, T> {
+    JsonVisitor {
+        processor: unsafe { &mut PROCESSOR },
+        _type: PhantomData,
+    }
+}
+
 fn deserialize_properties<'de, D>(
     deserializer: D,
 ) -> Result<Map<String, serde_json::Value>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct PropVisitor<T>(PhantomData<fn() -> T>);
-
-    impl<'de> Visitor<'de> for PropVisitor<Map<String, serde_json::Value>> {
+    impl<'de> Visitor<'de> for JsonVisitor<'_, Map<String, serde_json::Value>> {
         /// Return type of this visitor. This visitor computes the max of a
         /// sequence of values of type T, so the type of the maximum is T.
         type Value = Map<String, serde_json::Value>;
@@ -83,6 +95,7 @@ where
             M: MapAccess<'de>,
         {
             dbg!("deserialize_properties");
+            dbg!(self.processor);
             while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
                 dbg!(key, value);
             }
@@ -91,7 +104,7 @@ where
         }
     }
 
-    let visitor = PropVisitor(PhantomData);
+    let visitor = get_visitor::<Map<String, serde_json::Value>>();
     deserializer.deserialize_map(visitor)
 }
 
@@ -101,9 +114,7 @@ fn deserialize_polygon<'de, D>(deserializer: D) -> Result<Coordinates, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct CoordVisitor<T>(PhantomData<fn() -> T>);
-
-    impl<'de> Visitor<'de> for CoordVisitor<Coordinates> {
+    impl<'de> Visitor<'de> for JsonVisitor<'_, Coordinates> {
         type Value = Coordinates;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -126,7 +137,7 @@ where
         }
     }
 
-    let visitor = CoordVisitor(PhantomData);
+    let visitor = get_visitor::<Coordinates>();
     deserializer.deserialize_seq(visitor)
 }
 
@@ -175,6 +186,7 @@ mod tests {
         } else {
             assert!(false, "Geometry::Polygon expected");
         }
+        assert!(false);
         Ok(())
     }
 
