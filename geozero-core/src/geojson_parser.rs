@@ -4,7 +4,6 @@ use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap as Map;
 use std::fmt;
 use std::io::Read;
-use std::marker::PhantomData;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,8 +137,8 @@ where
             self.processor.poly_begin(0, 0);
             while let Some(coords) = seq.next_element::<Coordinates>()? {
                 dbg!("ring");
-                for coord in coords {
-                    dbg!(coord);
+                for _coord in coords {
+                    // dbg!(coord);
                 }
             }
 
@@ -198,7 +197,6 @@ mod tests {
         } else {
             assert!(false, "Geometry::Polygon expected");
         }
-        assert!(false);
         Ok(())
     }
 
