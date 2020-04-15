@@ -1,7 +1,9 @@
+use geozero_api::{DebugReader, FeatureProcessor};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap as Map;
 use std::fmt;
+use std::io::Read;
 use std::marker::PhantomData;
 
 #[derive(Deserialize)]
@@ -61,18 +63,23 @@ pub enum Geometry {
     },
 }
 
-static mut PROCESSOR: u32 = 0;
+static mut PROCESSOR: DebugReader = DebugReader {}; // FIXME: thread_local! + RefCell
 
-struct JsonVisitor<'a, T> {
-    processor: &'a mut u32,
-    _type: PhantomData<fn() -> T>,
+struct PropertyVisitor<'a> {
+    processor: &'a mut dyn FeatureProcessor,
 }
 
-fn get_visitor<'a, T>() -> JsonVisitor<'a, T> {
-    JsonVisitor {
-        processor: unsafe { &mut PROCESSOR },
-        _type: PhantomData,
-    }
+struct CoordVisitor<'a> {
+    processor: &'a mut dyn FeatureProcessor,
+}
+
+pub fn read_json<R: Read, P: FeatureProcessor + Sized>(
+    reader: R,
+    _processor: P,
+) -> serde_json::Result<()> {
+    // PROCESSOR = &mut processor;
+    let _fc: FeatureCollection = serde_json::from_reader(reader)?;
+    Ok(())
 }
 
 fn deserialize_properties<'de, D>(
@@ -81,7 +88,7 @@ fn deserialize_properties<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    impl<'de> Visitor<'de> for JsonVisitor<'_, Map<String, serde_json::Value>> {
+    impl<'de> Visitor<'de> for PropertyVisitor<'de> {
         /// Return type of this visitor. This visitor computes the max of a
         /// sequence of values of type T, so the type of the maximum is T.
         type Value = Map<String, serde_json::Value>;
@@ -95,7 +102,7 @@ where
             M: MapAccess<'de>,
         {
             dbg!("deserialize_properties");
-            dbg!(self.processor);
+            self.processor.properties_begin();
             while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
                 dbg!(key, value);
             }
@@ -104,7 +111,9 @@ where
         }
     }
 
-    let visitor = get_visitor::<Map<String, serde_json::Value>>();
+    let visitor = PropertyVisitor {
+        processor: unsafe { &mut PROCESSOR },
+    };
     deserializer.deserialize_map(visitor)
 }
 
@@ -114,7 +123,7 @@ fn deserialize_polygon<'de, D>(deserializer: D) -> Result<Coordinates, D::Error>
 where
     D: Deserializer<'de>,
 {
-    impl<'de> Visitor<'de> for JsonVisitor<'_, Coordinates> {
+    impl<'de> Visitor<'de> for CoordVisitor<'de> {
         type Value = Coordinates;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -126,6 +135,7 @@ where
             S: SeqAccess<'de>,
         {
             dbg!("deserialize_polygon");
+            self.processor.poly_begin(0, 0);
             while let Some(coords) = seq.next_element::<Coordinates>()? {
                 dbg!("ring");
                 for coord in coords {
@@ -137,7 +147,9 @@ where
         }
     }
 
-    let visitor = get_visitor::<Coordinates>();
+    let visitor = CoordVisitor {
+        processor: unsafe { &mut PROCESSOR },
+    };
     deserializer.deserialize_seq(visitor)
 }
 
