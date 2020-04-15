@@ -60,3 +60,6 @@ pub use feature_processor::*;
 pub use geometry_processor::*;
 pub use multiplex::*;
 pub use property_processor::*;
+
+
+pub struct DebugReader {}
