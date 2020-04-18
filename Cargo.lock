@@ -383,6 +383,7 @@ dependencies = [
  "criterion",
  "geozero-api",
  "serde",
+ "serde-transcode",
  "serde_json",
 ]
 
@@ -1106,6 +1107,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36df6ac6412072f67cf767ebbde4133a5b2e88e76dc6187fa7104cd16f783399"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde-transcode"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97528f0dfcf8ce2d51d995cb513a103b9cd301dc3f387a9cae5ef974381d4e1c"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

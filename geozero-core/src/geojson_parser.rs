@@ -1,160 +1,172 @@
-use geozero_api::{DebugReader, FeatureProcessor};
-use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use geozero_api::FeatureProcessor;
+use serde::Deserialize;
 use std::collections::BTreeMap as Map;
-use std::fmt;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeatureCollection {
+struct FeatureCollection {
     #[serde(rename = "type")]
-    pub obj_type: FeatureCollectionType,
-    pub features: Vec<Feature>,
+    obj_type: FeatureCollectionType,
+    features: Vec<Feature>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Feature {
+struct Feature {
     #[serde(rename = "type")]
-    pub obj_type: FeatureType,
-    #[serde(deserialize_with = "deserialize_properties")]
-    pub properties: Map<String, serde_json::Value>,
-    pub geometry: Geometry,
+    obj_type: FeatureType,
+    properties: Map<String, serde_json::Value>,
+    geometry: Geometry,
 }
 
 #[derive(Deserialize)]
-pub enum FeatureCollectionType {
+enum FeatureCollectionType {
     FeatureCollection,
 }
 
 #[derive(Deserialize)]
-pub enum FeatureType {
+enum FeatureType {
     Feature,
 }
 
-pub type Latitude = f32;
-pub type Longitude = f32;
-pub type Coordinate = (Latitude, Longitude);
-pub type Coordinates = Vec<Coordinate>;
+type Latitude = f32;
+type Longitude = f32;
+type Coordinate = (Latitude, Longitude);
+type Coordinates = Vec<Coordinate>;
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-pub enum Geometry {
-    Point {
-        coordinates: Coordinate,
-    },
-    MultiPoint {
-        coordinates: Coordinates,
-    },
-    LineString {
-        coordinates: Coordinates,
-    },
-    MultiLineString {
-        coordinates: Vec<Coordinates>,
-    },
-    Polygon {
-        #[serde(deserialize_with = "deserialize_polygon")]
-        coordinates: Coordinates,
-    },
-    MultiPolygon {
-        coordinates: Vec<Vec<Coordinates>>,
-    },
+enum Geometry {
+    Point { coordinates: Coordinate },
+    MultiPoint { coordinates: Coordinates },
+    LineString { coordinates: Coordinates },
+    MultiLineString { coordinates: Vec<Coordinates> },
+    Polygon { coordinates: Vec<Coordinates> },
+    MultiPolygon { coordinates: Vec<Vec<Coordinates>> },
+    GeometryCollection,
 }
 
-static mut PROCESSOR: DebugReader = DebugReader {}; // FIXME: thread_local! + RefCell
-
-struct PropertyVisitor<'a> {
-    processor: &'a mut dyn FeatureProcessor,
+#[derive(Deserialize)]
+struct GeojsonPrelude {
+    #[serde(rename = "type")]
+    obj_type: GeojsonType,
 }
 
-struct CoordVisitor<'a> {
-    processor: &'a mut dyn FeatureProcessor,
+#[derive(Deserialize, PartialEq, Debug)]
+enum GeojsonType {
+    Unknwown,
+    FeatureCollection,
+    Feature,
+    Geometry,
 }
 
-pub fn read_json<R: Read, P: FeatureProcessor + Sized>(
+fn read_geojson_prelude<R: Read>(reader: R) -> (GeojsonType, usize) {
+    let mut geojsontype: GeojsonType = GeojsonType::Unknwown;
+    let mut read_ofs = 0;
+    let bufreader = BufReader::new(reader);
+    let mut buf = Vec::with_capacity(1024);
+    if bufreader
+        .take(buf.capacity() as u64)
+        .read_until(b'[', &mut buf)
+        .is_ok()
+    {
+        if let Ok(prelude) = String::from_utf8(buf) {
+            let preludeobj = prelude.replace("[", "0}");
+            if let Ok(gj) = serde_json::from_str::<GeojsonPrelude>(&preludeobj) {
+                geojsontype = gj.obj_type;
+                if geojsontype == GeojsonType::FeatureCollection && prelude.ends_with("[") {
+                    read_ofs = prelude.len();
+                }
+            }
+        }
+    }
+    (geojsontype, read_ofs)
+}
+
+pub fn process_geojson<R: Read + Seek + Clone, P: FeatureProcessor + Sized>(
     reader: R,
-    _processor: P,
+    mut processor: P,
 ) -> serde_json::Result<()> {
-    // PROCESSOR = &mut processor;
-    let _fc: FeatureCollection = serde_json::from_reader(reader)?;
+    let (geojsontype, read_ofs) = read_geojson_prelude(reader.clone());
+    dbg!(&geojsontype, read_ofs);
+    match geojsontype {
+        GeojsonType::FeatureCollection if read_ofs > 0 => {
+            // iteratate features
+            read_features(reader, read_ofs, &mut processor)?;
+        }
+        GeojsonType::Feature => {
+            // parse feature
+            let f: Feature = serde_json::from_reader(reader)?;
+            process_feature(&f, &mut processor);
+        }
+        GeojsonType::Geometry => {
+            // parse feature
+            let g: Geometry = serde_json::from_reader(reader)?;
+            process_geometry(&g, &mut processor);
+        }
+        _ => {
+            dbg!("read_geojson_prelude failed");
+        }
+    }
     Ok(())
 }
 
-fn deserialize_properties<'de, D>(
-    deserializer: D,
-) -> Result<Map<String, serde_json::Value>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    impl<'de> Visitor<'de> for PropertyVisitor<'de> {
-        /// Return type of this visitor. This visitor computes the max of a
-        /// sequence of values of type T, so the type of the maximum is T.
-        type Value = Map<String, serde_json::Value>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a key value map")
-        }
-
-        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-        where
-            M: MapAccess<'de>,
-        {
-            dbg!("deserialize_properties");
-            self.processor.properties_begin();
-            while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
-                dbg!(key, value);
-            }
-
-            Ok(Map::new())
-        }
+fn read_features<R: Read + Seek, P: FeatureProcessor + Sized>(
+    mut reader: R,
+    read_ofs: usize,
+    processor: &mut P,
+) -> serde_json::Result<()> {
+    reader.seek(SeekFrom::Start(read_ofs as u64)).unwrap();
+    dbg!();
+    let seq = serde_json::from_reader(reader).into_iter();
+    for f in seq {
+        process_feature(&f, processor);
     }
-
-    let visitor = PropertyVisitor {
-        processor: unsafe { &mut PROCESSOR },
-    };
-    deserializer.deserialize_map(visitor)
+    Ok(())
 }
 
-const EMPTY_COORDINATES: Coordinates = Coordinates::new();
+fn process_feature<P: FeatureProcessor + Sized>(feat: &Feature, processor: &mut P) {
+    dbg!();
+    process_geometry(&feat.geometry, processor);
+}
 
-fn deserialize_polygon<'de, D>(deserializer: D) -> Result<Coordinates, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    impl<'de> Visitor<'de> for CoordVisitor<'de> {
-        type Value = Coordinates;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a coordinate sequence")
+fn process_geometry<P: FeatureProcessor + Sized>(geom: &Geometry, processor: &mut P) {
+    match geom {
+        Geometry::Point { coordinates } => {
+            processor.point_begin(0);
+            // if multi_dim(processor) {
+            // } else {
+            processor.pointxy(coordinates.0 as f64, coordinates.1 as f64, 0);
+            // }
+            processor.point_end();
         }
-
-        fn visit_seq<S>(self, mut seq: S) -> Result<Coordinates, S::Error>
-        where
-            S: SeqAccess<'de>,
-        {
-            dbg!("deserialize_polygon");
-            self.processor.poly_begin(0, 0);
-            while let Some(coords) = seq.next_element::<Coordinates>()? {
-                dbg!("ring");
-                for _coord in coords {
-                    // dbg!(coord);
-                }
-            }
-
-            Ok(EMPTY_COORDINATES)
+        Geometry::MultiPoint { coordinates } => {
+            processor.multipoint_begin(coordinates.len(), 0);
+            // read_points(processor, geometry, 0, coordinates.len());
+            processor.multipoint_end();
         }
+        Geometry::LineString { coordinates } => {
+            processor.line_begin(coordinates.len(), 0);
+            // read_points(processor, geometry, 0, coordinates.len());
+            processor.line_end(0);
+        }
+        Geometry::MultiLineString { coordinates } => {
+            processor.multiline_begin(coordinates.len(), 0);
+            // read_multi_line(processor, geometry, 0);
+            processor.multiline_end();
+        }
+        Geometry::Polygon { coordinates } => {
+            processor.poly_begin(coordinates.len(), 0);
+            // read_polygon(processor, geometry, false, 0);
+            processor.poly_end(0);
+        }
+        _ => todo!(),
     }
-
-    let visitor = CoordVisitor {
-        processor: unsafe { &mut PROCESSOR },
-    };
-    deserializer.deserialize_seq(visitor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geozero_api::DebugReader;
 
     const POLYGON: &str = r#"{
     "type": "FeatureCollection",
@@ -171,6 +183,24 @@ mod tests {
         }
     }]
 }"#;
+
+    const POLYGON_FEATURE: &str = r#"{
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        },
+        "properties": {
+            "test1": 1,
+            "test2": 1.1,
+            "test3": "test3"
+        }
+        }"#;
+
+    const POLYGON_GEOMETRY: &str = r#"{
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        }"#;
 
     const POINT: &str = r#"{
     "type": "FeatureCollection",
@@ -189,19 +219,27 @@ mod tests {
 }"#;
 
     #[test]
-    fn test_json_str() -> serde_json::Result<()> {
+    fn deserialize_fc() -> serde_json::Result<()> {
         let fc: FeatureCollection = serde_json::from_str(POLYGON)?;
         assert_eq!(fc.features.len(), 1);
         if let Geometry::Polygon { coordinates } = &fc.features[0].geometry {
-            assert!(coordinates.is_empty());
+            assert_eq!(coordinates[0].len(), 5);
         } else {
             assert!(false, "Geometry::Polygon expected");
+        }
+
+        let fc: FeatureCollection = serde_json::from_str(POINT)?;
+        assert_eq!(fc.features.len(), 1);
+        if let Geometry::Point { coordinates } = &fc.features[0].geometry {
+            assert_eq!(coordinates, &(1.0, 1.0));
+        } else {
+            assert!(false, "Geometry::Point expected");
         }
         Ok(())
     }
 
     #[test]
-    fn test_missing_type() -> serde_json::Result<()> {
+    fn missing_type() -> serde_json::Result<()> {
         let json = r#"{
     "type": "WrongType",
     "features": [{
@@ -221,6 +259,10 @@ mod tests {
             )
         );
 
+        let reader = std::io::Cursor::new(&json);
+        let res = process_geojson(reader, DebugReader {});
+        assert_eq!(res.err().map(|e| e.to_string()), None);
+
         let json = r#"{
     "features": [{
         "type": "Feature",
@@ -237,19 +279,130 @@ mod tests {
             fc.err().map(|e| e.to_string()),
             Some("missing field `type` at line 11 column 1".to_string())
         );
+
+        let reader = std::io::Cursor::new(&json);
+        let res = process_geojson(reader, DebugReader {});
+        assert_eq!(res.err().map(|e| e.to_string()), None);
+
         Ok(())
     }
 
     #[test]
-    fn test_from_reader() -> serde_json::Result<()> {
-        let reader = std::io::Cursor::new(&POINT);
-        let fc: FeatureCollection = serde_json::from_reader(reader)?;
-        assert_eq!(fc.features.len(), 1);
-        if let Geometry::Point { coordinates } = &fc.features[0].geometry {
-            assert_eq!(coordinates, &(1.0, 1.0));
-        } else {
-            assert!(false, "Geometry::Point expected");
+    fn prelude_reader() -> serde_json::Result<()> {
+        let json = r#"{
+    "name": "poly_landmarks",
+    "type": "FeatureCollection",
+    "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+    "features": [
+        { "type": "Feature", "properties": { }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -74.020683, 40.691059 ], [ -74.02092, 40.691208 ], [ -74.020466, 40.69124 ], [ -74.020683, 40.691059 ] ] ] } },
+        { "type": "Feature", "properties": { }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -73.939885, 40.846674 ], [ -73.940083, 40.846213 ], [ -73.940434, 40.845506 ], [ -73.942533, 40.846403 ], [ -73.94209, 40.84785 ], [ -73.940574, 40.847582 ], [ -73.939686, 40.847381 ], [ -73.939885, 40.846674 ] ] ] } }
+    ]
+}"#;
+        let reader = std::io::Cursor::new(&json);
+        let (geojsontype, read_ofs) = read_geojson_prelude(reader);
+        assert_eq!(geojsontype, GeojsonType::FeatureCollection);
+        assert_eq!(read_ofs, 172);
+        Ok(())
+    }
+
+    #[test]
+    fn feature_collection() -> serde_json::Result<()> {
+        // let reader = std::io::Cursor::new(&POLYGON);
+        let json = r#"{
+    "type": "FeatureCollection",
+    "features": [{
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        },
+        "properties": {
+            "test1": 1,
+            "test2": 1.1,
+            "test3": "test3"
         }
+    }"#;
+        let reader = std::io::Cursor::new(&json);
+        let res = process_geojson(reader, DebugReader {});
+        assert!(res.is_ok());
+
+        let json = r#"{
+    "type": "FeatureCollection",
+    "features": [{
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        },
+        "properties": {
+            "test1": 1,
+            "test2": 1.1,
+            "test3": "test3"
+        }
+    }{
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        },
+        "properties": {
+            "test1": 1,
+            "test2": 1.1,
+            "test3": "test3"
+        }
+    }"#;
+        dbg!("read multi features");
+        let reader = std::io::Cursor::new(&json);
+        let res = process_geojson(reader, DebugReader {});
+        assert!(res.is_ok());
+
+        let json = r#"{
+    "type": "FeatureCollection",
+    "features": [{
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        },
+        "properties": {
+            "test1": 1,
+            "test2": 1.1,
+            "test3": "test3"
+        }
+    },{
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[[30, 10], [40, 40], [20, 40], [10, 20], [30, 10]]]
+        },
+        "properties": {
+            "test1": 1,
+            "test2": 1.1,
+            "test3": "test3"
+        }
+    }]
+}"#;
+        dbg!("read multi features");
+        let reader = std::io::Cursor::new(&json);
+        let res = process_geojson(reader, DebugReader {});
+        assert!(res.is_ok());
+        assert!(false);
+        Ok(())
+    }
+
+    #[test]
+    fn feature() -> serde_json::Result<()> {
+        let reader = std::io::Cursor::new(&POLYGON_FEATURE);
+        let res = process_geojson(reader, DebugReader {});
+        assert!(res.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn geometry() -> serde_json::Result<()> {
+        let reader = std::io::Cursor::new(&POLYGON_GEOMETRY);
+        let res = process_geojson(reader, DebugReader {});
+        assert!(res.is_ok());
         Ok(())
     }
 }

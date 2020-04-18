@@ -2,4 +2,4 @@ pub mod geojson;
 mod geojson_parser;
 pub mod svg;
 
-pub use geojson_parser::read_json;
+pub use geojson_parser::process_geojson;
